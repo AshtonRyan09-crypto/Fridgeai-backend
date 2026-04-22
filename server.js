@@ -9,10 +9,8 @@ app.use(cors());
 // ─── Your Anthropic API key — set this in Railway/Render as an env variable ──
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
-// ─── App token — blocks requests not coming from the iOS app ──────────────────
-// Must match the APP_SECRET value hardcoded in index.html.
-// The iOS app sends this in the x-app-secret header on every request.
-const CRISPER_APP_TOKEN = "bb150cd50fe81d5d302a0a5ef89c61916aa10f35cad71b65620f5a29c251ae55";
+// ─── App gate — set APPGATE in Railway environment variables ──────────────────
+const APPGATE = process.env.APPGATE;
 
 // ─── Rate limiting ────────────────────────────────────────────────────────────
 // This stops any single user from spamming the API and running up your bill.
@@ -42,11 +40,9 @@ const scanLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-// ─── App secret middleware — protects all /api routes ─────────────────────────
-// Rejects any request that doesn't include the correct x-app-secret header.
-// This prevents anyone who finds the backend URL from using your AI credits.
+// ─── App gate middleware — rejects requests without the correct header ─────────
 app.use("/api", (req, res, next) => {
-  if (!CRISPER_APP_TOKEN || req.headers["x-app-secret"] !== CRISPER_APP_TOKEN) {
+  if (APPGATE && req.headers["x-app-gate"] !== APPGATE) {
     return res.status(401).json({ error: "Unauthorized" });
   }
   next();
