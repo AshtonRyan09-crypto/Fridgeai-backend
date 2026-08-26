@@ -1,3 +1,13 @@
+// jose v6 verifies signatures through the WebCrypto API, which it reaches via
+// the GLOBAL `crypto`. Node 19+ exposes that global; Node 18 does not, and
+// `engines` currently allows Node 18. Without this shim jose throws
+// "crypto is not defined" for EVERY token — including valid ones — which fails
+// closed and would lock out every user the moment REQUIRE_AUTH is turned on.
+// Guarded, so it is a no-op on Node 19+.
+if (!globalThis.crypto) {
+    globalThis.crypto = require("node:crypto").webcrypto;
+}
+
 const express = require("express");
 const cors = require("cors");
 const rateLimit = require("express-rate-limit");
@@ -51,6 +61,38 @@ if (!APPGATE) {
     );
     process.exit(1);
 }
+
+// ─── Authentication ───────────────────────────────────────────────────────────
+// Grace-period design. Two ways in:
+//   1. A Supabase access token, cryptographically VERIFIED against the project's
+//      published JWKS. This is real authentication and identifies a user.
+//   2. The app gate — the shared value in index.html. This is not authentication;
+//      it ships in the bundle and anyone who unzips the .ipa has it. It exists
+//      only so the build currently on people's phones keeps working.
+//
+// Flip REQUIRE_AUTH=true (a Railway variable, no code change) once the logs show
+// enough traffic arriving with a token. Until then every request is tagged
+// auth=jwt or auth=gate so the ratio is measurable.
+const SUPABASE_URL = (process.env.SUPABASE_URL ||
+    "https://qgkvzawkuovknplzialk.supabase.co").replace(/\/+$/, "");
+const JWKS_URL = `${SUPABASE_URL}/auth/v1/.well-known/jwks.json`;
+const ISSUER = `${SUPABASE_URL}/auth/v1`;
+const REQUIRE_AUTH = String(process.env.REQUIRE_AUTH || "").trim() === "true";
+
+// jose v6 is ESM-only, so it cannot be require()d from this CommonJS file.
+// Load it once at boot and await the same promise on each request.
+let jwtVerify = null;
+let JWKS = null;
+const joseReady = import("jose")
+    .then((jose) => {
+        jwtVerify = jose.jwtVerify;
+        // Caches the key set in memory and refetches when it sees an unknown kid.
+        JWKS = jose.createRemoteJWKSet(new URL(JWKS_URL));
+    })
+    .catch((err) => {
+        console.error("FATAL: could not load 'jose':", err && err.message);
+        process.exit(1);
+    });
 
 // ─── Server-side request shape ────────────────────────────────────────────────
 // The client cannot be trusted to choose any of these: index.html ships inside
@@ -206,34 +248,66 @@ app.use((req, res, next) => {
     const started = Date.now();
     res.on("finish", () => {
         if (req.path === "/") return; // health checks are noise
+        // auth= is the measurement that decides when REQUIRE_AUTH can be flipped
+        // on. sub is truncated: enough to distinguish users, not enough to be a
+        // usable identifier sitting in a log.
+        const a = req.auth || {};
         console.log(
             `${req.method} ${req.originalUrl} ${res.statusCode} ` +
-            `${Date.now() - started}ms ip=${req.ip}`
+            `${Date.now() - started}ms ip=${req.ip} ` +
+            `auth=${a.mode || "none"}${a.sub ? ` sub=${a.sub.slice(0, 8)}` : ""}`
         );
     });
     next();
 });
 
-// ─── App gate ─────────────────────────────────────────────────────────────────
-// NOTE: this is not real authentication. The value ships inside index.html, so
-// anyone who unzips the .ipa has it. Replacing this with verified Supabase JWTs
-// is work package WP2.
-app.use("/api", (req, res, next) => {
-    const sent = String(req.headers["x-app-gate"] || "").trim();
-    if (sent !== APPGATE) {
-        // Logged so a rejection is visible in Railway logs instead of silent. The
-        // two fingerprints side by side say whether this is a whitespace problem
-        // (same 4+4, different len) or a genuinely different value (different 4+4).
-        console.warn(
-            `AUTH FAIL ${req.method} ${req.originalUrl} ` +
-            `ip=${req.ip} xff=${req.headers["x-forwarded-for"] || "-"} ` +
-            `sent=${fingerprint(sent)} expected=${fingerprint(APPGATE)}`
-        );
-        return res.status(401).json({
-            error: { type: "unauthorized", message: "Unauthorized." },
-        });
+// ─── Authenticate ─────────────────────────────────────────────────────────────
+app.use("/api", async (req, res, next) => {
+    const header = String(req.headers.authorization || "");
+    const bearer = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+    const gateSent = String(req.headers["x-app-gate"] || "").trim();
+
+    // Path 1 — a real, verified user.
+    let jwtError = null;
+    if (bearer) {
+        try {
+            await joseReady;
+            // jwtVerify checks the signature, exp, nbf and iss. Note this is
+            // verify, NOT decode: decoding without verifying would let anyone
+            // assert any `sub` they liked, which is worse than no auth at all.
+            const { payload } = await jwtVerify(bearer, JWKS, { issuer: ISSUER });
+            if (!payload.sub) throw new Error("token has no sub claim");
+            req.auth = { mode: "jwt", sub: payload.sub };
+            return next();
+        } catch (err) {
+            jwtError = (err && (err.code || err.message)) || "unknown";
+        }
     }
-    next();
+
+    // Path 2 — the app gate, during the grace period only.
+    if (!REQUIRE_AUTH && gateSent && gateSent === APPGATE) {
+        req.auth = { mode: jwtError ? "gate(jwt-failed)" : "gate", sub: null };
+        if (jwtError) {
+            // A token was offered and rejected. Worth seeing: it means a client
+            // is sending something we can't verify, and after the flip to
+            // REQUIRE_AUTH those users would be locked out.
+            console.warn(`JWT REJECTED (fell back to gate): ${jwtError}`);
+        }
+        return next();
+    }
+
+    // Rejected. Fingerprints show whether a gate mismatch is a whitespace
+    // problem (same 4+4, different len) or a different value (different 4+4).
+    console.warn(
+        `AUTH FAIL ${req.method} ${req.originalUrl} ` +
+        `ip=${req.ip} xff=${req.headers["x-forwarded-for"] || "-"} ` +
+        `bearer=${bearer ? "present" : "absent"} jwtError=${jwtError || "-"} ` +
+        `sent=${fingerprint(gateSent)} expected=${fingerprint(APPGATE)} ` +
+        `requireAuth=${REQUIRE_AUTH}`
+    );
+    return res.status(401).json({
+        error: { type: "unauthorized", message: "Unauthorized." },
+    });
 });
 
 // ─── Rate limiting ────────────────────────────────────────────────────────────
@@ -243,9 +317,17 @@ const rateLimitMessage = (msg) => ({
     error: { type: "rate_limited", message: msg },
 });
 
+// Key on the VERIFIED user id when we have one, falling back to the client IP
+// for gate-only requests. Per-user is strictly better than per-IP: it survives
+// the user changing networks, and it stops a whole office behind one NAT from
+// sharing a bucket. Once REQUIRE_AUTH is on, every request is keyed per user.
+const keyByUserOrIp = (req) =>
+    (req.auth && req.auth.sub) ? `u:${req.auth.sub}` : `ip:${req.ip}`;
+
 const generalLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     limit: 60,
+    keyGenerator: keyByUserOrIp,
     message: rateLimitMessage(
         "Too many requests. Please wait a few minutes and try again."
     ),
@@ -256,6 +338,7 @@ const generalLimiter = rateLimit({
 const scanLimiter = rateLimit({
     windowMs: 60 * 60 * 1000,
     limit: 20,
+    keyGenerator: keyByUserOrIp,
     message: rateLimitMessage(
         "Scan limit reached. Please try again later."
     ),
@@ -393,5 +476,10 @@ app.listen(PORT, () => {
     console.log(
         `model=${MODEL} maxTokens(image/text)=${MAX_TOKENS_IMAGE}/${MAX_TOKENS_TEXT} ` +
         `dailyBudget=${DAILY_REQUEST_BUDGET} dailyImageBudget=${DAILY_IMAGE_BUDGET}`
+    );
+    console.log(
+        `auth: requireAuth=${REQUIRE_AUTH} ` +
+        `${REQUIRE_AUTH ? "(JWT only)" : "(grace period — JWT or app gate)"} ` +
+        `jwks=${JWKS_URL}`
     );
 });
