@@ -9,8 +9,21 @@ const app = express();
 // Without this, req.ip is Railway's internal proxy address — identical for every
 // user — so every rate limiter below would share ONE bucket across the entire
 // user base, and any single client could exhaust it for everyone.
-// Exactly one proxy hop, hence 1.
-app.set("trust proxy", 1);
+//
+// TWO hops, not one. Measured against production: a request from a client at
+// 103.22.147.94 arrives as
+//     x-forwarded-for: 103.22.147.94, 152.233.15.120
+// where the second entry is a Railway edge address that rotates between
+// requests from the same client. With `1`, req.ip was that rotating edge
+// address, so a single client's traffic was spread across several limiter
+// buckets. With `2`, req.ip is the real client.
+//
+// Counting hops from the right (which is what Express does) is what makes this
+// spoof-resistant: a client that forges extra X-Forwarded-For entries only
+// lengthens the left of the chain, and the trusted count still lands on the
+// address Railway actually observed. Re-verify this number if Railway ever
+// changes its ingress topology.
+app.set("trust proxy", 2);
 
 // 2mb is ~12x headroom: both image paths resize to 768px before sending
 // (index.html:995 and :1185), which is well under 200KB of base64.
