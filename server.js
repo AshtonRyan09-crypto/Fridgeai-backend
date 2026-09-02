@@ -1,8 +1,8 @@
 // jose v6 verifies signatures through the WebCrypto API, which it reaches via
 // the GLOBAL `crypto`. Node 19+ exposes that global; Node 18 does not, and
 // `engines` currently allows Node 18. Without this shim jose throws
-// "crypto is not defined" for EVERY token — including valid ones — which fails
-// closed and would lock out every user the moment REQUIRE_AUTH is turned on.
+// "crypto is not defined" for EVERY token — including valid ones — which now
+// fails closed and locks out every user, since the token is the only way in.
 // Guarded, so it is a no-op on Node 19+.
 if (!globalThis.crypto) {
     globalThis.crypto = require("node:crypto").webcrypto;
@@ -43,41 +43,21 @@ app.use(cors());
 // ─── Secrets, from the environment only ───────────────────────────────────────
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
-// Trimmed: a trailing space or newline on the Railway variable is invisible in
-// the dashboard but makes every request fail with 401.
-const APPGATE = (process.env.APPGATE || "").trim();
-
-// Short fingerprint for log lines — shows enough to compare two values without
-// ever writing the secret itself into the logs.
-const fingerprint = (s) =>
-    s ? `${s.slice(0, 4)}…${s.slice(-4)}(len=${s.length})` : "<empty>";
-
-// Fail closed. An earlier `if (APPGATE && ...)` check silently disabled the gate
-// whenever the variable was missing, leaving the paid proxy wide open.
-if (!APPGATE) {
-    console.error(
-        "FATAL: APPGATE is not set (or is only whitespace). Refusing to start " +
-        "rather than run an unauthenticated proxy to a paid API."
-    );
-    process.exit(1);
-}
-
 // ─── Authentication ───────────────────────────────────────────────────────────
-// Grace-period design. Two ways in:
-//   1. A Supabase access token, cryptographically VERIFIED against the project's
-//      published JWKS. This is real authentication and identifies a user.
-//   2. The app gate — the shared value in index.html. This is not authentication;
-//      it ships in the bundle and anyone who unzips the .ipa has it. It exists
-//      only so the build currently on people's phones keeps working.
+// One way in: a Supabase access token, cryptographically VERIFIED against the
+// project's published JWKS. Every request is identified by a real user.
 //
-// Flip REQUIRE_AUTH=true (a Railway variable, no code change) once the logs show
-// enough traffic arriving with a token. Until then every request is tagged
-// auth=jwt or auth=gate so the ratio is measurable.
+// The old `x-app-gate` shared value is gone. It was never authentication — it
+// shipped in the app bundle, so anyone who unzipped the .ipa had it and could
+// spend Anthropic credits from any machine. It survived only as a grace-period
+// fallback for installs predating the token work; the app was never publicly
+// released, so there were no such installs to protect. Removed along with the
+// REQUIRE_AUTH switch that used to toggle it, since with no fallback left there
+// is nothing to toggle. The APPGATE Railway variable is now dead config.
 const SUPABASE_URL = (process.env.SUPABASE_URL ||
     "https://qgkvzawkuovknplzialk.supabase.co").replace(/\/+$/, "");
 const JWKS_URL = `${SUPABASE_URL}/auth/v1/.well-known/jwks.json`;
 const ISSUER = `${SUPABASE_URL}/auth/v1`;
-const REQUIRE_AUTH = String(process.env.REQUIRE_AUTH || "").trim() === "true";
 
 // jose v6 is ESM-only, so it cannot be require()d from this CommonJS file.
 // Load it once at boot and await the same promise on each request.
@@ -248,8 +228,7 @@ app.use((req, res, next) => {
     const started = Date.now();
     res.on("finish", () => {
         if (req.path === "/") return; // health checks are noise
-        // auth= is the measurement that decides when REQUIRE_AUTH can be flipped
-        // on. sub is truncated: enough to distinguish users, not enough to be a
+        // sub is truncated: enough to distinguish users, not enough to be a
         // usable identifier sitting in a log.
         const a = req.auth || {};
         console.log(
@@ -265,9 +244,7 @@ app.use((req, res, next) => {
 app.use("/api", async (req, res, next) => {
     const header = String(req.headers.authorization || "");
     const bearer = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
-    const gateSent = String(req.headers["x-app-gate"] || "").trim();
 
-    // Path 1 — a real, verified user.
     let jwtError = null;
     if (bearer) {
         try {
@@ -284,26 +261,12 @@ app.use("/api", async (req, res, next) => {
         }
     }
 
-    // Path 2 — the app gate, during the grace period only.
-    if (!REQUIRE_AUTH && gateSent && gateSent === APPGATE) {
-        req.auth = { mode: jwtError ? "gate(jwt-failed)" : "gate", sub: null };
-        if (jwtError) {
-            // A token was offered and rejected. Worth seeing: it means a client
-            // is sending something we can't verify, and after the flip to
-            // REQUIRE_AUTH those users would be locked out.
-            console.warn(`JWT REJECTED (fell back to gate): ${jwtError}`);
-        }
-        return next();
-    }
-
-    // Rejected. Fingerprints show whether a gate mismatch is a whitespace
-    // problem (same 4+4, different len) or a different value (different 4+4).
+    // Rejected. jwtError distinguishes an expired token (routine, the client
+    // should refresh and retry) from a bad signature (someone is forging).
     console.warn(
         `AUTH FAIL ${req.method} ${req.originalUrl} ` +
         `ip=${req.ip} xff=${req.headers["x-forwarded-for"] || "-"} ` +
-        `bearer=${bearer ? "present" : "absent"} jwtError=${jwtError || "-"} ` +
-        `sent=${fingerprint(gateSent)} expected=${fingerprint(APPGATE)} ` +
-        `requireAuth=${REQUIRE_AUTH}`
+        `bearer=${bearer ? "present" : "absent"} jwtError=${jwtError || "-"}`
     );
     return res.status(401).json({
         error: { type: "unauthorized", message: "Unauthorized." },
@@ -311,16 +274,18 @@ app.use("/api", async (req, res, next) => {
 });
 
 // ─── Rate limiting ────────────────────────────────────────────────────────────
-// Per client IP, which is only meaningful because of app.set("trust proxy", 1).
-// Still per-IP rather than per-user: keying on a verified user id is WP2.
+// Keyed per verified user, falling back to the client IP — which is only
+// meaningful because of app.set("trust proxy", 2). The hop count must be 2:
+// Railway sends "<client>, <edge>" and the edge address rotates, so 1 keys the
+// limiter on a moving target.
 const rateLimitMessage = (msg) => ({
     error: { type: "rate_limited", message: msg },
 });
 
-// Key on the VERIFIED user id when we have one, falling back to the client IP
-// for gate-only requests. Per-user is strictly better than per-IP: it survives
-// the user changing networks, and it stops a whole office behind one NAT from
-// sharing a bucket. Once REQUIRE_AUTH is on, every request is keyed per user.
+// Key on the VERIFIED user id. Per-user is strictly better than per-IP: it
+// survives the user changing networks, and it stops a whole office behind one
+// NAT from sharing a bucket. Every authenticated request now has a sub, so the
+// ip: fallback only covers requests that never reached the auth middleware.
 const keyByUserOrIp = (req) =>
     (req.auth && req.auth.sub) ? `u:${req.auth.sub}` : `ip:${req.ip}`;
 
@@ -442,9 +407,9 @@ app.post("/api/claude", applyLimiter, handleClaude);
 app.post("/api/scan", applyLimiter, handleClaude);
 
 // ─── Health check ─────────────────────────────────────────────────────────────
-// No gate and no limiter (it sits outside the /api mount). Returns no config.
+// No auth and no limiter (it sits outside the /api mount). Returns no config.
 app.get("/", (req, res) => {
-    res.json({ status: "FridgeAI API running", version: "1.1.0" });
+    res.json({ status: "FridgeAI API running", version: "1.2.0" });
 });
 
 // ─── Error handler ────────────────────────────────────────────────────────────
@@ -472,14 +437,9 @@ app.use((err, req, res, _next) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`FridgeAI backend running on port ${PORT}`);
-    console.log(`APPGATE loaded: ${fingerprint(APPGATE)}`);
     console.log(
         `model=${MODEL} maxTokens(image/text)=${MAX_TOKENS_IMAGE}/${MAX_TOKENS_TEXT} ` +
         `dailyBudget=${DAILY_REQUEST_BUDGET} dailyImageBudget=${DAILY_IMAGE_BUDGET}`
     );
-    console.log(
-        `auth: requireAuth=${REQUIRE_AUTH} ` +
-        `${REQUIRE_AUTH ? "(JWT only)" : "(grace period — JWT or app gate)"} ` +
-        `jwks=${JWKS_URL}`
-    );
+    console.log(`auth: verified Supabase JWT only, jwks=${JWKS_URL}`);
 });
