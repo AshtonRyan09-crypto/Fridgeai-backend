@@ -245,6 +245,21 @@ app.use("/api", async (req, res, next) => {
     const header = String(req.headers.authorization || "");
     const bearer = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
 
+    // Accepted limitation: this is signature verification only, with no
+    // revocation check. A token stays valid for its full life even after the
+    // user signs out or deletes their account, so there is a window in which a
+    // captured token still works. Deliberately not closed, because the bound is
+    // small and checking would cost a Supabase round-trip on every AI call:
+    //   - measured TTL is exactly 3600s, and it is NOT renewable — signing out
+    //     and deleting both call /auth/v1/logout first, which revokes the
+    //     refresh token, so no new access token can be minted
+    //   - limits are keyed per verified sub, capping one stale token at 240
+    //     text and 20 image calls across that hour, inside the daily breaker
+    //   - RLS is scoped to auth.uid(), so a deleted user's token reaches no rows
+    // The real gap this leaves is operational: there is no way to cut off one
+    // specific user short of rotating the Supabase signing key, which would log
+    // everyone out. If that lever is ever needed, a BLOCKED_SUBS env variable
+    // checked against payload.sub adds it without a database call.
     let jwtError = null;
     if (bearer) {
         try {
