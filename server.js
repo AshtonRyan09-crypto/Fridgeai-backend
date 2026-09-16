@@ -88,6 +88,37 @@ function asFraction(v) {
     return n > 1 ? n / 100 : n;
 }
 
+// Work out what fraction of the price we actually keep.
+//
+// The guard exists because RevenueCat's TEST event arrives with
+// commission_percentage AND tax_percentage both set to 0 — not null. A
+// null-only fallback therefore does not fire, and 1 - 0 - 0 = 1.0 credits the
+// FULL price as net. On a real paid event that overstates net by the store's
+// whole cut and overpays a percentage-based influencer by ~15-18% on every
+// renewal, quietly and forever. Apple always takes a cut on a non-zero charge,
+// so a zero commission on money actually received is not believable: distrust it
+// and fall back to the configured default instead.
+//
+// A genuinely zero-priced event (TEST, a free trial, a $0 grace period) keeps
+// keep=1 harmlessly, because 0 * anything is 0.
+function takehomeFraction(grossCents, commissionPct, taxPct, ctx) {
+    if (commissionPct === null && taxPct === null) {
+        return { keep: STORE_TAKEHOME_DEFAULT, source: "default:absent" };
+    }
+    if (grossCents !== 0 && !commissionPct) {
+        console.warn(
+            `TAKEHOME SUSPECT ${ctx}: gross=${grossCents} but commission_percentage=` +
+            `${commissionPct}; using STORE_TAKEHOME_DEFAULT=${STORE_TAKEHOME_DEFAULT}. ` +
+            `Check the raw payload in revenue_events before paying anyone.`
+        );
+        return { keep: STORE_TAKEHOME_DEFAULT, source: "default:zero-commission" };
+    }
+    return {
+        keep: Math.max(0, 1 - (commissionPct || 0) - (taxPct || 0)),
+        source: "payload",
+    };
+}
+
 // Minimal PostgREST client. Deliberately fetch() rather than
 // @supabase/supabase-js: this backend's whole security story is a small audited
 // dependency tree (71 packages, no install scripts), and one HTTP call does not
@@ -548,9 +579,9 @@ app.post("/webhooks/revenuecat", webhookLimiter, async (req, res) => {
     const signedGross = isRefund ? -Math.abs(grossUsd) : (isIncome ? grossUsd : 0);
     const commissionPct = asFraction(ev.commission_percentage);
     const taxPct = asFraction(ev.tax_percentage);
-    const keep = (commissionPct === null && taxPct === null)
-        ? STORE_TAKEHOME_DEFAULT
-        : Math.max(0, 1 - (commissionPct || 0) - (taxPct || 0));
+    const { keep, source: keepSource } = takehomeFraction(
+        signedGross, commissionPct, taxPct, `${type} ${eventId}`
+    );
     const netUsd = Math.round(signedGross * keep);
 
     // ── Attribution ──────────────────────────────────────────────────────────
@@ -636,7 +667,7 @@ app.post("/webhooks/revenuecat", webhookLimiter, async (req, res) => {
     console.log(
         `WEBHOOK ${type}${cancelReason ? `/${cancelReason}` : ""} ` +
         `offer=${offerCode || "-"} influencer=${influencerId ? "yes" : "none"} ` +
-        `netUSD=${netUsd}`
+        `netUSD=${netUsd} keep=${keep}(${keepSource})`
     );
     res.json({ ok: true });
 });
@@ -686,7 +717,7 @@ app.post("/api/redeem-code", generalLimiter, async (req, res) => {
 // ─── Health check ─────────────────────────────────────────────────────────────
 // No auth and no limiter (it sits outside the /api mount). Returns no config.
 app.get("/", (req, res) => {
-    res.json({ status: "FridgeAI API running", version: "1.3.0" });
+    res.json({ status: "FridgeAI API running", version: "1.3.1" });
 });
 
 // ─── Error handler ────────────────────────────────────────────────────────────
