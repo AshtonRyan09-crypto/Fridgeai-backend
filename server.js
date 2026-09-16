@@ -642,6 +642,9 @@ app.post("/webhooks/revenuecat", webhookLimiter, async (req, res) => {
         transaction_id: ev.transaction_id || null,
         original_transaction_id: origTxn,
         currency: ev.currency || null,
+        // SANDBOX vs PRODUCTION. Recorded as a column so payouts can be
+        // grouped by it; test purchases must never reach a real payout.
+        environment: ev.environment || "UNKNOWN",
         local_price_cents: toCents(ev.price_in_purchased_currency),
         gross_usd_cents: signedGross,
         net_usd_cents: netUsd,
@@ -717,7 +720,7 @@ app.post("/api/redeem-code", generalLimiter, async (req, res) => {
 // ─── Health check ─────────────────────────────────────────────────────────────
 // No auth and no limiter (it sits outside the /api mount). Returns no config.
 app.get("/", (req, res) => {
-    res.json({ status: "FridgeAI API running", version: "1.3.1" });
+    res.json({ status: "FridgeAI API running", version: "1.4.0" });
 });
 
 // ─── Error handler ────────────────────────────────────────────────────────────
