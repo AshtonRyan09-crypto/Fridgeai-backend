@@ -21,7 +21,14 @@ update revenue_events
 
 create index if not exists revenue_events_env_idx on revenue_events (environment);
 
-create or replace view influencer_payouts as
+-- DROP then CREATE, not CREATE OR REPLACE. Postgres will only let REPLACE
+-- append columns to a view; inserting `environment` before `month` is read
+-- as renaming `month` and fails with 42P16. Dropping the dependent view
+-- first is required because it selects from this one.
+drop view if exists influencer_payouts_due;
+drop view if exists influencer_payouts;
+
+create view influencer_payouts as
 select
     i.handle,
     i.commission_type,
@@ -47,5 +54,5 @@ group by i.handle, i.commission_type, i.bounty_cents, i.commission_pct,
          coalesce(e.environment, 'UNKNOWN'), date_trunc('month', e.occurred_at);
 
 -- What to actually pay: production only.
-create or replace view influencer_payouts_due as
+create view influencer_payouts_due as
 select * from influencer_payouts where environment = 'PRODUCTION';
