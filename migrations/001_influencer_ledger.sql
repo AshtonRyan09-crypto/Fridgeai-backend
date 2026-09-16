@@ -62,52 +62,78 @@ create table if not exists code_redemptions (
 alter table code_redemptions enable row level security;
 create index if not exists code_redemptions_influencer_idx on code_redemptions (influencer_id);
 
+-- Attribution is keyed on the SUBSCRIPTION, not the user. The offer code only
+-- appears on the transaction that redeemed it; later renewals carry no code, so
+-- the first event that names an offer pins the whole chain here and every
+-- subsequent renewal inherits it via original_transaction_id. This is also why
+-- revenue share needs no app change: the code arrives from Apple, not the app.
+create table if not exists transaction_attributions (
+    original_transaction_id text primary key,
+    influencer_id           uuid not null references influencers(id),
+    offer_code              text,
+    first_seen_at           timestamptz not null default now()
+);
+alter table transaction_attributions enable row level security;
+
 -- Every webhook event lands here, including ones that move no money, because the
 -- raw payload is the only audit trail if a payout is ever disputed. event_id is
 -- the primary key so a redelivered webhook is a no-op: providers retry on any
 -- non-2xx and duplicates would otherwise double-pay.
+--
+-- Money is stored in USD cents from RevenueCat's `price`, which it has already
+-- normalised across storefronts. price_in_purchased_currency and currency are
+-- kept for reference only — never sum those, subscribers pay in many currencies.
 create table if not exists revenue_events (
-    event_id        text primary key,
-    app_user_id     text not null,
-    user_id         uuid,
-    influencer_id   uuid references influencers(id),
-    event_type      text not null,
-    product_id      text,
-    store           text,
-    offer_ref       text,
-    currency        text,
-    gross_cents     integer not null default 0,
-    net_cents       integer not null default 0,   -- after store commission; negative on refund
-    is_revenue      boolean not null default false,
-    occurred_at     timestamptz not null,
-    raw             jsonb not null,
-    created_at      timestamptz not null default now()
+    event_id            text primary key,
+    app_user_id         text not null,
+    user_id             uuid,
+    influencer_id       uuid references influencers(id),
+    event_type          text not null,
+    cancel_reason       text,
+    product_id          text,
+    store               text,
+    offer_code          text,
+    transaction_id      text,
+    original_transaction_id text,
+    currency            text,
+    local_price_cents   integer,               -- reference only, mixed currencies
+    gross_usd_cents     integer not null default 0,
+    net_usd_cents       integer not null default 0,   -- after store cut and tax; negative on refund
+    commission_pct      numeric(6,4),
+    tax_pct             numeric(6,4),
+    is_revenue          boolean not null default false,
+    occurred_at         timestamptz not null,
+    raw                 jsonb not null,
+    created_at          timestamptz not null default now()
 );
 alter table revenue_events enable row level security;
 create index if not exists revenue_events_influencer_idx on revenue_events (influencer_id, occurred_at);
+create index if not exists revenue_events_orig_txn_idx   on revenue_events (original_transaction_id);
 create index if not exists revenue_events_type_idx       on revenue_events (event_type);
 
--- Payout rollup, by influencer and calendar month, in each currency.
+-- Payout rollup, by influencer and calendar month, in USD cents.
 -- Query it from the Supabase SQL editor; there is deliberately no public
 -- endpoint for it, so there is no new authenticated admin surface to defend.
 create or replace view influencer_payouts as
 select
     i.handle,
     i.commission_type,
-    date_trunc('month', e.occurred_at) as month,
-    e.currency,
-    count(*) filter (where e.is_revenue and e.net_cents > 0)          as paid_events,
-    count(distinct e.app_user_id) filter (where e.is_revenue
-        and e.event_type = 'INITIAL_PURCHASE')                       as conversions,
-    sum(e.gross_cents) filter (where e.is_revenue)                   as gross_cents,
-    sum(e.net_cents)   filter (where e.is_revenue)                   as net_cents,
+    date_trunc('month', e.occurred_at)                               as month,
+    count(distinct e.original_transaction_id)
+        filter (where e.event_type = 'INITIAL_PURCHASE')             as conversions,
+    count(*) filter (where e.is_revenue and e.net_usd_cents > 0)     as paid_events,
+    count(*) filter (where e.net_usd_cents < 0)                      as refunds,
+    sum(e.gross_usd_cents) filter (where e.is_revenue)               as gross_usd_cents,
+    sum(e.net_usd_cents)   filter (where e.is_revenue)               as net_usd_cents,
     case i.commission_type
-        when 'bounty' then coalesce(i.bounty_cents, 0) * count(distinct e.app_user_id)
-                             filter (where e.is_revenue and e.event_type = 'INITIAL_PURCHASE')
-        when 'revshare' then round(sum(e.net_cents) filter (where e.is_revenue)
-                             * coalesce(i.commission_pct, 0) / 100.0)
-    end                                                              as commission_cents
+        when 'bounty' then coalesce(i.bounty_cents, 0)
+                           * count(distinct e.original_transaction_id)
+                             filter (where e.event_type = 'INITIAL_PURCHASE')
+        when 'revshare' then greatest(round(
+                             sum(e.net_usd_cents) filter (where e.is_revenue)
+                             * coalesce(i.commission_pct, 0) / 100.0), 0)
+    end                                                              as commission_usd_cents
 from revenue_events e
 join influencers i on i.id = e.influencer_id
 group by i.handle, i.commission_type, i.bounty_cents, i.commission_pct,
-         date_trunc('month', e.occurred_at), e.currency;
+         date_trunc('month', e.occurred_at);

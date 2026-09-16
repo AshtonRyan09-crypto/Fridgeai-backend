@@ -60,13 +60,33 @@ const LEDGER_ENABLED = Boolean(SUPABASE_SERVICE_KEY && REVENUECAT_WEBHOOK_SECRET
 // otherwise. Wrong here means wrong payouts, so set it explicitly in Railway.
 const STORE_TAKEHOME_DEFAULT = Number(process.env.STORE_TAKEHOME_DEFAULT || 0.85);
 
-// Event types that move money. Everything else is still recorded — the raw
+// Event types that move money in. Everything else is still recorded — the raw
 // payload is the audit trail — but contributes nothing to a payout.
 const REVENUE_EVENTS = new Set(["INITIAL_PURCHASE", "RENEWAL", "NON_RENEWING_PURCHASE"]);
-// Types that take money back. RevenueCat's exact refund taxonomy has changed
-// before, so treat this as configuration rather than fact: check the event_type
-// values actually arriving in revenue_events before trusting a payout run.
-const REFUND_EVENTS = new Set(["REFUND", "CANCELLATION"]);
+
+// Refunds are NOT their own event type. They arrive as CANCELLATION with a
+// cancel_reason, and only some reasons mean money went back:
+//   CUSTOMER_SUPPORT    → Apple refunded. Money out. Claw back the commission.
+//   UNSUBSCRIBE         → the customer turned OFF auto-renew. They keep access to
+//                         the end of the period and NOTHING is refunded.
+//   BILLING_ERROR       → payment failed; no money ever arrived, and the matching
+//                         charge was never recorded as revenue either.
+//   DEVELOPER_INITIATED → we refunded them. Money out.
+// Treating every CANCELLATION as a refund would deduct revenue from an
+// influencer every time a subscriber merely cancelled, which is the single
+// easiest way to underpay somebody and not notice.
+const REFUND_CANCEL_REASONS = new Set(["CUSTOMER_SUPPORT", "DEVELOPER_INITIATED"]);
+
+// commission_percentage and tax_percentage replaced the deprecated
+// takehome_percentage. RevenueCat's docs do not pin down whether these arrive as
+// fractions (0.15) or percentages (15), so normalise: anything above 1 is a
+// percentage. Getting this backwards inflates payouts ~6x, so the first real
+// event is worth eyeballing in revenue_events before a payout run.
+function asFraction(v) {
+    const n = Number(v);
+    if (!Number.isFinite(n) || n < 0) return null;
+    return n > 1 ? n / 100 : n;
+}
 
 // Minimal PostgREST client. Deliberately fetch() rather than
 // @supabase/supabase-js: this backend's whole security story is a small audited
@@ -514,28 +534,52 @@ app.post("/webhooks/revenuecat", webhookLimiter, async (req, res) => {
     }
 
     const type = String(ev.type || "UNKNOWN");
-    const isRevenue = REVENUE_EVENTS.has(type);
-    const isRefund = REFUND_EVENTS.has(type);
+    const cancelReason = ev.cancellation_reason || ev.cancel_reason || null;
+    const origTxn = ev.original_transaction_id || null;
+    const offerCode = ev.offer_code || null;
 
-    // takehome_percentage is the store cut already applied, when present.
-    const takehome = Number.isFinite(Number(ev.takehome_percentage))
-        ? Number(ev.takehome_percentage)
-        : STORE_TAKEHOME_DEFAULT;
-    const grossRaw = toCents(ev.price ?? ev.price_in_purchased_currency ?? 0);
-    const gross = isRefund ? -Math.abs(grossRaw) : (isRevenue ? grossRaw : 0);
-    const net = Math.round(gross * takehome);
+    const isIncome = REVENUE_EVENTS.has(type);
+    const isRefund = type === "CANCELLATION" && REFUND_CANCEL_REASONS.has(String(cancelReason));
 
-    // ATTRIBUTION IS INERT UNTIL THE APP CALLS Purchases.logIn.
-    // As of 1.0 (5) StoreKitManager.swift only calls Purchases.configure with no
-    // appUserID, so RevenueCat mints an anonymous "$RCAnonymousID:..." and this
-    // will never match a Supabase uuid — influencer_id stays null and every event
-    // is still recorded, just unattributed. That is safe but not useful. The fix
-    // is one line in the app (logIn with the Supabase user id after sign-in), so
-    // it ships with the in-app code page; until then pay on App Store Connect
-    // redemption counts, which need no attribution at all.
-    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(appUserId);
+    // `price` is RevenueCat's USD-normalised amount, which is what makes a payout
+    // summable across storefronts. The local amount is recorded for reference and
+    // must never be summed.
+    const grossUsd = toCents(ev.price);
+    const signedGross = isRefund ? -Math.abs(grossUsd) : (isIncome ? grossUsd : 0);
+    const commissionPct = asFraction(ev.commission_percentage);
+    const taxPct = asFraction(ev.tax_percentage);
+    const keep = (commissionPct === null && taxPct === null)
+        ? STORE_TAKEHOME_DEFAULT
+        : Math.max(0, 1 - (commissionPct || 0) - (taxPct || 0));
+    const netUsd = Math.round(signedGross * keep);
+
+    // ── Attribution ──────────────────────────────────────────────────────────
+    // Priority order matters. The offer code is the strongest signal and only
+    // appears on the redeeming transaction, so when it is present we pin the
+    // subscription. Renewals carry no code and inherit via original_transaction_id.
     let influencerId = null;
-    if (isUuid) {
+
+    if (offerCode) {
+        const m = await sb(
+            `promo_codes?apple_offer_ref=eq.${encodeURIComponent(offerCode)}` +
+            `&active=is.true&select=influencer_id`
+        );
+        if (m.ok && Array.isArray(m.data) && m.data.length) influencerId = m.data[0].influencer_id;
+    }
+    if (!influencerId && origTxn) {
+        const prior = await sb(
+            `transaction_attributions?original_transaction_id=eq.${encodeURIComponent(origTxn)}` +
+            `&select=influencer_id`
+        );
+        if (prior.ok && Array.isArray(prior.data) && prior.data.length) {
+            influencerId = prior.data[0].influencer_id;
+        }
+    }
+    // Last resort, and inert until the app has a code page: a user who typed a
+    // code in-app. Requires Purchases.logIn to be wired so app_user_id is the
+    // Supabase uuid; today it is an anonymous RevenueCat id and this never hits.
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(appUserId);
+    if (!influencerId && isUuid) {
         const look = await sb(
             `code_redemptions?user_id=eq.${encodeURIComponent(appUserId)}&select=influencer_id`
         );
@@ -544,24 +588,38 @@ app.post("/webhooks/revenuecat", webhookLimiter, async (req, res) => {
         }
     }
 
-    const row = {
+    // Pin the chain so renewals inherit. Ignore conflicts: first attribution wins,
+    // which stops a later event moving revenue to a different influencer.
+    if (influencerId && origTxn && offerCode) {
+        await sb("transaction_attributions", "POST", {
+            original_transaction_id: origTxn,
+            influencer_id: influencerId,
+            offer_code: offerCode,
+        }, { Prefer: "return=minimal,resolution=ignore-duplicates" });
+    }
+
+    const ins = await sb("revenue_events", "POST", {
         event_id: eventId,
         app_user_id: String(appUserId),
         user_id: isUuid ? appUserId : null,
         influencer_id: influencerId,
         event_type: type,
+        cancel_reason: cancelReason,
         product_id: ev.product_id || null,
         store: ev.store || null,
-        offer_ref: ev.offer_code || ev.presented_offering_id || null,
+        offer_code: offerCode,
+        transaction_id: ev.transaction_id || null,
+        original_transaction_id: origTxn,
         currency: ev.currency || null,
-        gross_cents: gross,
-        net_cents: net,
-        is_revenue: isRevenue || isRefund,
+        local_price_cents: toCents(ev.price_in_purchased_currency),
+        gross_usd_cents: signedGross,
+        net_usd_cents: netUsd,
+        commission_pct: commissionPct,
+        tax_pct: taxPct,
+        is_revenue: isIncome || isRefund,
         occurred_at: new Date(Number(ev.event_timestamp_ms) || Date.now()).toISOString(),
         raw: req.body,
-    };
-
-    const ins = await sb("revenue_events", "POST", row, { Prefer: "return=minimal" });
+    }, { Prefer: "return=minimal" });
 
     // 23505 = unique violation on event_id, i.e. a redelivery. Already recorded,
     // so answer 200 or the provider will keep retrying forever.
@@ -576,8 +634,9 @@ app.post("/webhooks/revenuecat", webhookLimiter, async (req, res) => {
     }
 
     console.log(
-        `WEBHOOK ${type} user=${String(appUserId).slice(0, 8)} ` +
-        `influencer=${influencerId ? "yes" : "none"} net=${net}${row.currency || ""}`
+        `WEBHOOK ${type}${cancelReason ? `/${cancelReason}` : ""} ` +
+        `offer=${offerCode || "-"} influencer=${influencerId ? "yes" : "none"} ` +
+        `netUSD=${netUsd}`
     );
     res.json({ ok: true });
 });
