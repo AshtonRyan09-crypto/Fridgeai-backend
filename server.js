@@ -43,6 +43,52 @@ app.use(cors());
 // ─── Secrets, from the environment only ───────────────────────────────────────
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
+// ─── Supabase service role, for the influencer ledger ─────────────────────────
+// The webhook receiver and the code-redemption endpoint write rows that belong
+// to no signed-in user, so they cannot go through RLS as the anon key does.
+// This key BYPASSES RLS entirely — it must never be sent to a client, never
+// logged, and never used on any path that echoes its response verbatim.
+// Absent key = the ledger is simply disabled, so the proxy still boots and the
+// AI features keep working; that is deliberate, because attribution failing
+// must never take down the app.
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+const REVENUECAT_WEBHOOK_SECRET = process.env.REVENUECAT_WEBHOOK_SECRET || "";
+const LEDGER_ENABLED = Boolean(SUPABASE_SERVICE_KEY && REVENUECAT_WEBHOOK_SECRET);
+
+// Fraction of the price you keep after the store's cut. Used only when the
+// webhook payload does not tell us: 0.85 under the Small Business Program, 0.70
+// otherwise. Wrong here means wrong payouts, so set it explicitly in Railway.
+const STORE_TAKEHOME_DEFAULT = Number(process.env.STORE_TAKEHOME_DEFAULT || 0.85);
+
+// Event types that move money. Everything else is still recorded — the raw
+// payload is the audit trail — but contributes nothing to a payout.
+const REVENUE_EVENTS = new Set(["INITIAL_PURCHASE", "RENEWAL", "NON_RENEWING_PURCHASE"]);
+// Types that take money back. RevenueCat's exact refund taxonomy has changed
+// before, so treat this as configuration rather than fact: check the event_type
+// values actually arriving in revenue_events before trusting a payout run.
+const REFUND_EVENTS = new Set(["REFUND", "CANCELLATION"]);
+
+// Minimal PostgREST client. Deliberately fetch() rather than
+// @supabase/supabase-js: this backend's whole security story is a small audited
+// dependency tree (71 packages, no install scripts), and one HTTP call does not
+// justify changing that.
+async function sb(path, method = "GET", body = null, extraHeaders = {}) {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+        method,
+        headers: {
+            apikey: SUPABASE_SERVICE_KEY,
+            Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
+            "Content-Type": "application/json",
+            ...extraHeaders,
+        },
+        body: body ? JSON.stringify(body) : undefined,
+    });
+    let data = null;
+    const text = await res.text();
+    if (text) { try { data = JSON.parse(text); } catch { data = text; } }
+    return { ok: res.ok, status: res.status, data };
+}
+
 // ─── Authentication ───────────────────────────────────────────────────────────
 // One way in: a Supabase access token, cryptographically VERIFIED against the
 // project's published JWKS. Every request is identified by a real user.
@@ -421,10 +467,167 @@ async function handleClaude(req, res) {
 app.post("/api/claude", applyLimiter, handleClaude);
 app.post("/api/scan", applyLimiter, handleClaude);
 
+
+// ─── Influencer ledger ────────────────────────────────────────────────────────
+
+// Per-IP limit only: this endpoint is hit by RevenueCat's servers, not users,
+// and a shared secret is the gate. Generous, because a burst of renewals on the
+// 1st of the month is normal traffic, not abuse.
+const webhookLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 600,
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
+// Constant-time compare. A plain === leaks the secret one byte at a time to
+// anyone who can measure response latency across enough attempts.
+function secretMatches(presented, expected) {
+    const a = Buffer.from(String(presented));
+    const b = Buffer.from(String(expected));
+    if (a.length !== b.length) return false;
+    return require("node:crypto").timingSafeEqual(a, b);
+}
+
+// Money in the payload is a float in major units ("9.99"). Convert to integer
+// cents immediately and never do arithmetic on the float: 0.1 + 0.2 problems in
+// a payout ledger are indefensible.
+function toCents(v) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return 0;
+    return Math.round(n * 100);
+}
+
+app.post("/webhooks/revenuecat", webhookLimiter, async (req, res) => {
+    if (!LEDGER_ENABLED) return res.status(503).json({ error: "ledger disabled" });
+    if (!secretMatches(req.headers.authorization || "", REVENUECAT_WEBHOOK_SECRET)) {
+        console.warn(`WEBHOOK AUTH FAIL ip=${req.ip}`);
+        return res.status(401).json({ error: "unauthorized" });
+    }
+
+    const ev = (req.body && req.body.event) || {};
+    const eventId = ev.id;
+    const appUserId = ev.app_user_id || ev.original_app_user_id;
+    if (!eventId || !appUserId) {
+        // 400 not 500: a payload we cannot key is not worth retrying.
+        return res.status(400).json({ error: "missing event id or app_user_id" });
+    }
+
+    const type = String(ev.type || "UNKNOWN");
+    const isRevenue = REVENUE_EVENTS.has(type);
+    const isRefund = REFUND_EVENTS.has(type);
+
+    // takehome_percentage is the store cut already applied, when present.
+    const takehome = Number.isFinite(Number(ev.takehome_percentage))
+        ? Number(ev.takehome_percentage)
+        : STORE_TAKEHOME_DEFAULT;
+    const grossRaw = toCents(ev.price ?? ev.price_in_purchased_currency ?? 0);
+    const gross = isRefund ? -Math.abs(grossRaw) : (isRevenue ? grossRaw : 0);
+    const net = Math.round(gross * takehome);
+
+    // ATTRIBUTION IS INERT UNTIL THE APP CALLS Purchases.logIn.
+    // As of 1.0 (5) StoreKitManager.swift only calls Purchases.configure with no
+    // appUserID, so RevenueCat mints an anonymous "$RCAnonymousID:..." and this
+    // will never match a Supabase uuid — influencer_id stays null and every event
+    // is still recorded, just unattributed. That is safe but not useful. The fix
+    // is one line in the app (logIn with the Supabase user id after sign-in), so
+    // it ships with the in-app code page; until then pay on App Store Connect
+    // redemption counts, which need no attribution at all.
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(appUserId);
+    let influencerId = null;
+    if (isUuid) {
+        const look = await sb(
+            `code_redemptions?user_id=eq.${encodeURIComponent(appUserId)}&select=influencer_id`
+        );
+        if (look.ok && Array.isArray(look.data) && look.data.length) {
+            influencerId = look.data[0].influencer_id;
+        }
+    }
+
+    const row = {
+        event_id: eventId,
+        app_user_id: String(appUserId),
+        user_id: isUuid ? appUserId : null,
+        influencer_id: influencerId,
+        event_type: type,
+        product_id: ev.product_id || null,
+        store: ev.store || null,
+        offer_ref: ev.offer_code || ev.presented_offering_id || null,
+        currency: ev.currency || null,
+        gross_cents: gross,
+        net_cents: net,
+        is_revenue: isRevenue || isRefund,
+        occurred_at: new Date(Number(ev.event_timestamp_ms) || Date.now()).toISOString(),
+        raw: req.body,
+    };
+
+    const ins = await sb("revenue_events", "POST", row, { Prefer: "return=minimal" });
+
+    // 23505 = unique violation on event_id, i.e. a redelivery. Already recorded,
+    // so answer 200 or the provider will keep retrying forever.
+    if (!ins.ok) {
+        const code = ins.data && ins.data.code;
+        if (ins.status === 409 || code === "23505") {
+            return res.json({ ok: true, duplicate: true });
+        }
+        // 500 on anything else so RevenueCat retries rather than dropping money.
+        console.error(`LEDGER WRITE FAIL ${type} status=${ins.status}`, ins.data);
+        return res.status(500).json({ error: "ledger write failed" });
+    }
+
+    console.log(
+        `WEBHOOK ${type} user=${String(appUserId).slice(0, 8)} ` +
+        `influencer=${influencerId ? "yes" : "none"} net=${net}${row.currency || ""}`
+    );
+    res.json({ ok: true });
+});
+
+// Attribution write. Sits inside the /api mount, so a verified JWT is required
+// and req.auth.sub is the real user — the code cannot be attributed to somebody
+// else's account. UNUSED until in-app code entry ships; deployed now so the data
+// is accumulating from the first redemption rather than being reconstructed.
+app.post("/api/redeem-code", generalLimiter, async (req, res) => {
+    if (!LEDGER_ENABLED) return res.status(503).json({ error: "ledger disabled" });
+
+    const raw = String((req.body && req.body.code) || "").trim().toUpperCase();
+    // Allowlist, not a denylist: this value is interpolated into a PostgREST
+    // query string, and index.html ships in the bundle so the client is hostile.
+    if (!/^[A-Z0-9]{3,20}$/.test(raw)) {
+        return res.status(400).json({ error: { type: "invalid_code", message: "That code isn't valid." } });
+    }
+
+    const found = await sb(
+        `promo_codes?code=eq.${encodeURIComponent(raw)}&active=is.true&select=code,influencer_id,offering_id`
+    );
+    if (!found.ok || !Array.isArray(found.data) || !found.data.length) {
+        return res.status(404).json({ error: { type: "unknown_code", message: "That code isn't recognised." } });
+    }
+    const { influencer_id, offering_id } = found.data[0];
+
+    // First code wins: user_id is unique, so a second attempt conflicts and we
+    // report the attribution that already stands rather than moving it.
+    const ins = await sb("code_redemptions", "POST", {
+        user_id: req.auth.sub,
+        code: raw,
+        influencer_id,
+        source: "in_app",
+    }, { Prefer: "return=minimal" });
+
+    if (!ins.ok && ins.status !== 409 && !(ins.data && ins.data.code === "23505")) {
+        console.error(`REDEEM WRITE FAIL status=${ins.status}`, ins.data);
+        return res.status(500).json({ error: { type: "server_error", message: "Please try again." } });
+    }
+    const alreadyAttributed = ins.status === 409 || (ins.data && ins.data.code === "23505");
+
+    // Only the offering id goes back to the client. Never the influencer, the
+    // commission, or anything else commercial.
+    res.json({ ok: true, offering: offering_id || null, already_applied: Boolean(alreadyAttributed) });
+});
+
 // ─── Health check ─────────────────────────────────────────────────────────────
 // No auth and no limiter (it sits outside the /api mount). Returns no config.
 app.get("/", (req, res) => {
-    res.json({ status: "FridgeAI API running", version: "1.2.0" });
+    res.json({ status: "FridgeAI API running", version: "1.3.0" });
 });
 
 // ─── Error handler ────────────────────────────────────────────────────────────
