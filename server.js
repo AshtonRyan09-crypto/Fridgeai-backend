@@ -55,6 +55,18 @@ const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 const REVENUECAT_WEBHOOK_SECRET = process.env.REVENUECAT_WEBHOOK_SECRET || "";
 const LEDGER_ENABLED = Boolean(SUPABASE_SERVICE_KEY && REVENUECAT_WEBHOOK_SECRET);
 
+// ─── RevenueCat secret key, for the entitlement gate ──────────────────────────
+// Read-only use here: we ask RevenueCat what this customer owns, never write.
+// `sk_...`, NOT the `appl_...` key in StoreKitManager.swift — that one is public
+// and ships in the app, and it cannot read another customer's record.
+//
+// REQUIRED. The process exits below if it is missing, deliberately. The
+// alternative — warn and allow — is how you end up with a control that looks
+// present in the code, reads fine in review, and silently gates nothing; this
+// codebase has already been bitten by exactly that (the APPGATE mismatch). A
+// boot failure is loud, immediate, and impossible to misread.
+const REVENUECAT_SECRET_KEY = process.env.REVENUECAT_SECRET_KEY || "";
+
 // Fraction of the price you keep after the store's cut. Used only when the
 // webhook payload does not tell us: 0.85 under the Small Business Program, 0.70
 // otherwise. Wrong here means wrong payouts, so set it explicitly in Railway.
@@ -385,6 +397,197 @@ app.use("/api", async (req, res, next) => {
     });
 });
 
+// ─── Entitlement gate ─────────────────────────────────────────────────────────
+// A verified JWT proves WHO is calling. It does not prove they are a customer,
+// and on its own it is a weak cost control: Supabase has email confirmation off
+// (`mailer_autoconfirm: true`), so anyone can mint a working account — and
+// therefore a working token — in seconds with a throwaway address. Limits are
+// keyed per `sub`, so a script that creates accounts gets a fresh bucket each
+// time and the per-user ceiling stops bounding anything. Measured during the
+// 2026-11-03 audit: two accounts, two valid tokens, no email ever seen.
+//
+// So spend is gated on OWNERSHIP, not identity. Crisper has no free tier — every
+// plan including "core" is a paid product — so "has an active entitlement" is
+// exactly the set of people whose AI calls we are happy to pay for. A throwaway
+// account now gets a 402 and costs us one cached lookup rather than an Anthropic
+// call. Free trials pass: RevenueCat reports a trial as an active entitlement.
+//
+// This needs no client change. StoreKitManager.identify() already calls
+// Purchases.logIn() with the Supabase uuid on every SESSION_SAVE, so the
+// RevenueCat app_user_id and the JWT `sub` are the same string.
+const RC_API = "https://api.revenuecat.com/v1/subscribers";
+const RC_TIMEOUT_MS = 8_000;
+
+// Checked in order; the first active one wins. These must match the entitlement
+// identifiers in the RevenueCat dashboard and in StoreKitManager.activePlan.
+const ENTITLEMENT_IDS = ["elite", "core"];
+
+// Positive answers are cached long enough to keep RevenueCat out of the hot path
+// (a subscription does not lapse mid-session), negatives only briefly — someone
+// who subscribes must not stay locked out, and the client flips its own state
+// the moment customerInfoStream fires, so a long negative TTL would show them a
+// working app whose AI calls still 402.
+const ENT_TTL_OK_MS = 15 * 60 * 1000;
+const ENT_TTL_DENY_MS = 60 * 1000;
+// Bounded, because the cache is keyed by `sub` and minting subs is free — an
+// unbounded Map here would just convert the signup hole into a memory leak.
+const ENT_CACHE_MAX = 5_000;
+
+const entCache = new Map();
+
+function entCacheGet(sub) {
+    const hit = entCache.get(sub);
+    if (!hit) return null;
+    if (Date.now() > hit.expires) { entCache.delete(sub); return null; }
+    return hit;
+}
+
+function entCacheSet(sub, allowed, ttl) {
+    // Map iterates in insertion order, so the first key is the oldest. Delete
+    // before setting so a refreshed entry moves to the back rather than keeping
+    // its original position and being evicted while still warm.
+    entCache.delete(sub);
+    entCache.set(sub, { allowed, expires: Date.now() + ttl });
+    while (entCache.size > ENT_CACHE_MAX) {
+        entCache.delete(entCache.keys().next().value);
+    }
+}
+
+/**
+ * Is this entitlement live right now?
+ *
+ * RevenueCat returns EXPIRED entitlements in the same map as active ones, so
+ * presence proves nothing and the date has to be compared here. A null
+ * `expires_date` means non-expiring (a lifetime grant), which is active.
+ *
+ * `grace_period_expires_date` is taken as well, and the later of the two wins.
+ * During a billing-retry grace period Apple has not been paid yet but the
+ * customer still has legitimate access, and locking out someone whose card just
+ * bounced — while the store still considers them subscribed — is a support
+ * ticket and a refund request, not a security win.
+ */
+function entitlementActive(ent) {
+    if (!ent || typeof ent !== "object") return false;
+    if (ent.expires_date === null || ent.expires_date === undefined) return true;
+    const candidates = [ent.expires_date, ent.grace_period_expires_date]
+        .map((d) => (d ? Date.parse(d) : NaN))
+        .filter((t) => Number.isFinite(t));
+    if (!candidates.length) return false;
+    return Math.max(...candidates) > Date.now();
+}
+
+/**
+ * Ask RevenueCat what this customer owns.
+ *
+ * Returns { allowed, definitive }. `definitive` separates "RevenueCat answered
+ * and the answer is no" from "we could not reach RevenueCat", because those two
+ * must not be treated alike — see requireEntitlement below.
+ */
+async function fetchEntitlement(sub) {
+    const res = await fetch(`${RC_API}/${encodeURIComponent(sub)}`, {
+        headers: {
+            Authorization: `Bearer ${REVENUECAT_SECRET_KEY}`,
+            Accept: "application/json",
+        },
+        signal: AbortSignal.timeout(RC_TIMEOUT_MS),
+    });
+
+    // This endpoint is "Get OR CREATE Customer". An app_user_id RevenueCat has
+    // never seen does NOT come back 404 — RevenueCat creates the customer and
+    // answers 201 with an empty entitlements map. So a 201 is itself proof that
+    // this account has never owned anything: a definitive no.
+    //
+    // The empty map would deny it anyway two lines down, but leaving it to that
+    // would make the deny depend on a coincidence of response shape rather than
+    // on a fact actually checked, and nothing would catch it if the shape moved.
+    //
+    // Known cost, accepted: because a read creates, a stream of freshly minted
+    // Supabase accounts leaves a trail of empty customers in RevenueCat. That is
+    // analytics noise rather than spend — RevenueCat bills on tracked revenue,
+    // not customer count — and a real user's record already exists by this
+    // point, created by Purchases.logIn() on the client. If the noise ever
+    // matters, the v2 endpoint (GET /v2/projects/{id}/customers/{id}) reads
+    // without creating; it needs a project id and a v2 key, which is the only
+    // reason it is not used here. Deleting the 201s instead would race the
+    // client's own logIn for a brand-new user.
+    if (res.status === 201) return { allowed: false, definitive: true };
+
+    // Not expected from this endpoint, but harmless to keep: if RevenueCat ever
+    // does answer 404, "no such customer" is still a definitive no.
+    if (res.status === 404) return { allowed: false, definitive: true };
+
+    // Any other non-2xx means WE are wrong — a revoked or malformed secret key
+    // most likely. Not the customer's fault, so it must not read as "no".
+    if (!res.ok) {
+        console.error(`RC LOOKUP ${res.status} for sub=${sub.slice(0, 8)}`);
+        return { allowed: false, definitive: false };
+    }
+
+    const data = await res.json();
+    const ents = (data && data.subscriber && data.subscriber.entitlements) || {};
+    const allowed = ENTITLEMENT_IDS.some((id) => entitlementActive(ents[id]));
+    return { allowed, definitive: true };
+}
+
+async function requireEntitlement(req, res, next) {
+    const sub = req.auth && req.auth.sub;
+    if (!sub) return res.status(401).json({
+        error: { type: "unauthorized", message: "Unauthorized." },
+    });
+
+    const cached = entCacheGet(sub);
+    if (cached) {
+        if (cached.allowed) return next();
+        return res.status(402).json({
+            error: {
+                type: "no_subscription",
+                message: "An active Crisper subscription is required.",
+            },
+        });
+    }
+
+    let result;
+    try {
+        result = await fetchEntitlement(sub);
+    } catch (err) {
+        console.error(`RC LOOKUP FAILED sub=${sub.slice(0, 8)}:`, err && err.message);
+        result = { allowed: false, definitive: false };
+    }
+
+    // FAIL OPEN when RevenueCat itself is unreachable, and say so loudly.
+    //
+    // The choice is between letting some free accounts through during a
+    // third-party outage and cutting off every paying customer during one. The
+    // second is worse: the gate exists to protect spend, and spend is already
+    // bounded underneath by the per-sub limits and the daily breaker, so an
+    // outage costs us a capped amount of money. Breaking the app for everyone
+    // who has paid costs us the customers. StoreKitManager.checkEntitlement()
+    // takes the same position on the client — "" on error, never a lockout.
+    //
+    // Not cached, so each request retries: the outage should stop mattering the
+    // moment RevenueCat recovers, not ENT_TTL_OK_MS later.
+    if (!result.definitive) {
+        console.warn(
+            `ENTITLEMENT FAIL-OPEN sub=${sub.slice(0, 8)} — RevenueCat unreachable, ` +
+            `allowing the request. Spend is still bounded by the per-sub limits ` +
+            `and the daily breaker.`
+        );
+        return next();
+    }
+
+    entCacheSet(sub, result.allowed, result.allowed ? ENT_TTL_OK_MS : ENT_TTL_DENY_MS);
+
+    if (result.allowed) return next();
+
+    console.warn(`ENTITLEMENT DENIED sub=${sub.slice(0, 8)}`);
+    return res.status(402).json({
+        error: {
+            type: "no_subscription",
+            message: "An active Crisper subscription is required.",
+        },
+    });
+}
+
 // ─── Rate limiting ────────────────────────────────────────────────────────────
 // Keyed per verified user, falling back to the client IP — which is only
 // meaningful because of app.set("trust proxy", 2). The hop count must be 2:
@@ -515,8 +718,17 @@ async function handleClaude(req, res) {
 // Both paths kept for backwards compatibility with the app already installed on
 // people's phones. They now behave identically, and the limiter is chosen by
 // content rather than by path.
-app.post("/api/claude", applyLimiter, handleClaude);
-app.post("/api/scan", applyLimiter, handleClaude);
+//
+// The limiter runs BEFORE the entitlement gate on purpose. The gate makes an
+// outbound call on a cache miss, so checking it first would let anyone holding a
+// free token drive unbounded traffic at RevenueCat. Behind the limiter, one sub
+// can trigger at most its own quota of lookups, and denials are cached anyway.
+//
+// Only these two routes are gated. /api/redeem-code stays open to any verified
+// user: it spends nothing, and attribution has to be recordable at the moment a
+// code is entered, which is necessarily before the subscription exists.
+app.post("/api/claude", applyLimiter, requireEntitlement, handleClaude);
+app.post("/api/scan", applyLimiter, requireEntitlement, handleClaude);
 
 
 // ─── Influencer ledger ────────────────────────────────────────────────────────
@@ -720,7 +932,7 @@ app.post("/api/redeem-code", generalLimiter, async (req, res) => {
 // ─── Health check ─────────────────────────────────────────────────────────────
 // No auth and no limiter (it sits outside the /api mount). Returns no config.
 app.get("/", (req, res) => {
-    res.json({ status: "FridgeAI API running", version: "1.4.0" });
+    res.json({ status: "FridgeAI API running", version: "1.5.0" });
 });
 
 // ─── Error handler ────────────────────────────────────────────────────────────
@@ -745,6 +957,21 @@ app.use((err, req, res, _next) => {
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────
+
+// Refuse to run without the entitlement key rather than running with the gate
+// quietly disabled. See the comment on REVENUECAT_SECRET_KEY: a security control
+// that fails silently is worse than one that is absent, because it stops anyone
+// from looking. Set REVENUECAT_SECRET_KEY in Railway BEFORE deploying this.
+if (!REVENUECAT_SECRET_KEY) {
+    console.error(
+        "FATAL: REVENUECAT_SECRET_KEY is not set. The entitlement gate cannot " +
+        "run without it, and starting anyway would serve paid AI calls to " +
+        "anyone who can create a free account. Set it in Railway (RevenueCat " +
+        "→ Project settings → API keys → secret key, 'sk_...') and redeploy."
+    );
+    process.exit(1);
+}
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`FridgeAI backend running on port ${PORT}`);
@@ -753,4 +980,8 @@ app.listen(PORT, () => {
         `dailyBudget=${DAILY_REQUEST_BUDGET} dailyImageBudget=${DAILY_IMAGE_BUDGET}`
     );
     console.log(`auth: verified Supabase JWT only, jwks=${JWKS_URL}`);
+    console.log(
+        `entitlement gate: ON, ids=[${ENTITLEMENT_IDS.join(", ")}] ` +
+        `cacheTTL(ok/deny)=${ENT_TTL_OK_MS / 1000}s/${ENT_TTL_DENY_MS / 1000}s`
+    );
 });

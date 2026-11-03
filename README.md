@@ -15,10 +15,28 @@ Go to railway.app and sign up with GitHub.
    - Go to github.com → New repository → "fridgeai-backend"
    - Upload all files from this folder
 
-### Step 3 — Set your API key
+### Step 3 — Set your API keys
 In Railway, click your project → Variables tab → Add:
   - Name:  ANTHROPIC_API_KEY
   - Value: your key from console.anthropic.com (starts with sk-ant-...)
+
+  - Name:  REVENUECAT_SECRET_KEY
+  - Value: RevenueCat → Project settings → API keys → secret key (starts with sk_)
+
+REVENUECAT_SECRET_KEY is REQUIRED — the server refuses to start without it, on
+purpose. It powers the entitlement gate, which checks that the caller actually
+holds an active subscription before any Anthropic credits are spent. A verified
+login is not enough on its own: Supabase has email confirmation off, so anyone
+can create a working account in seconds, and without this gate those free
+accounts can spend your Anthropic budget.
+
+It must be the SECRET key (sk_...), not the appl_... key in
+StoreKitManager.swift. That one is public, ships inside the app, and cannot read
+a customer record.
+
+Optional, for the influencer ledger (absent = ledger quietly disabled, AI keeps
+working): SUPABASE_SERVICE_ROLE_KEY, REVENUECAT_WEBHOOK_SECRET,
+STORE_TAKEHOME_DEFAULT.
 
 ### Step 4 — Deploy
 Railway deploys automatically. Click your project to see the URL —
